@@ -1,107 +1,175 @@
-from flask import Flask, request, jsonify
 import requests
+import hashlib
+import time
 import json
 import os
 from datetime import datetime
+from flask import Flask, jsonify
+import threading
 
 app = Flask(__name__)
 
 # ========================================
-# 简道云配置（已填好，无需修改）
+# 所有配置已填好，无需修改
 # ========================================
-JIANDAOYUN_API_KEY = os.environ.get("JIANDAOYUN_API_KEY", "ZDOh1mmoium1dUZy1IJRtDvSxMLJDeM3")
-JIANDAOYUN_APP_ID  = os.environ.get("JIANDAOYUN_APP_ID",  "659d2050806aac7d76af53f5")
-JIANDAOYUN_FORM_ID = os.environ.get("JIANDAOYUN_FORM_ID", "69b3af25e63532229a28f450")
+SS_TOKEN      = "40f5ZdyDpUFE5Ws"
+SS_PROJECT_ID = "f1n28qu"
 
-JIANDAOYUN_URL = f"https://api.jiandaoyun.com/api/v5/app/{JIANDAOYUN_APP_ID}/entry/{JIANDAOYUN_FORM_ID}/data"
+JDY_API_KEY = "ZDOh1mmoium1dUZy1IJRtDvSxMLJDeM3"
+JDY_APP_ID  = "659d2050806aac7d76af53f5"
+JDY_FORM_ID = "69b3af25e63532229a28f450"
 
-# ========================================
-# 接收 SaleSmartly Webhook
-# ========================================
-@app.route("/webhook", methods=["POST"])
-def receive_webhook():
-    try:
-        data = request.json
-        print(f"[{datetime.now()}] 收到询盘数据:\n{json.dumps(data, ensure_ascii=False, indent=2)}")
+JDY_URL = f"https://api.jiandaoyun.com/api/v5/app/{JDY_APP_ID}/entry/{JDY_FORM_ID}/data"
 
-        # 从 SaleSmartly 数据中提取字段
-        customer_name    = data.get("visitor_name") or data.get("name") or ""
-        whatsapp         = data.get("whatsapp") or data.get("phone") or data.get("visitor_phone") or ""
-        email            = data.get("email") or data.get("visitor_email") or ""
-        company_name     = data.get("company") or data.get("company_name") or ""
-        company_website  = data.get("website") or data.get("company_website") or ""
-        country          = data.get("country") or data.get("visitor_country") or ""
-        city             = data.get("city") or data.get("visitor_city") or ""
-        main_product     = data.get("product") or data.get("main_product") or ""
-        source           = data.get("channel") or data.get("source") or "SaleSmartly"
-        customer_type    = data.get("customer_type") or ""
-        salesperson      = data.get("salesperson") or data.get("agent_name") or ""
-        customer_segment = data.get("segment") or data.get("customer_segment") or ""
-        follow_status    = data.get("status") or data.get("follow_status") or ""
-        remark           = data.get("remark") or data.get("note") or data.get("message") or ""
-        created_time     = data.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# 每60秒同步一次
+SYNC_INTERVAL = 60
 
-        success = write_to_jiandaoyun(
-            customer_name, whatsapp, email, company_name, company_website,
-            country, city, main_product, source, customer_type,
-            salesperson, customer_segment, follow_status, remark, created_time
-        )
-
-        if success:
-            return jsonify({"status": "ok", "message": "同步成功 ✅"}), 200
-        else:
-            return jsonify({"status": "error", "message": "写入简道云失败"}), 500
-
-    except Exception as e:
-        print(f"[错误] {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+# 记录上次同步时间
+last_sync_time = int(time.time()) - SYNC_INTERVAL
 
 
 # ========================================
-# 写入简道云（字段ID已按截图填好）
+# 生成 SaleSmartly 签名
 # ========================================
-def write_to_jiandaoyun(
-    customer_name, whatsapp, email, company_name, company_website,
-    country, city, main_product, source, customer_type,
-    salesperson, customer_segment, follow_status, remark, created_time
-):
+def make_sign(params: dict) -> str:
+    sorted_keys = sorted(params.keys())
+    sign_str = SS_TOKEN + "".join(f"{k}={params[k]}" for k in sorted_keys)
+    return hashlib.md5(sign_str.encode("utf-8")).hexdigest()
+
+
+# ========================================
+# 从 SaleSmartly 拉取新客户列表
+# ========================================
+def fetch_new_customers():
+    global last_sync_time
+
+    now = int(time.time())
+
+    params = {
+        "project_id": SS_PROJECT_ID,
+        "page": "1",
+        "page_size": "50",
+        "start_time": str(last_sync_time),
+        "end_time": str(now),
+    }
+
+    sign = make_sign(params)
+
     headers = {
-        "Authorization": f"Bearer {JIANDAOYUN_API_KEY}",
+        "external-sign": sign,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.get(
+            "https://api.salesmartly.com/api/chat-user/get-page-list",
+            params=params,
+            headers=headers,
+            timeout=10
+        )
+        data = response.json()
+        print(f"[{datetime.now()}] SaleSmartly响应: {json.dumps(data, ensure_ascii=False)[:200]}")
+
+        if data.get("code") == 0:
+            customers = data.get("data", {}).get("list", [])
+            last_sync_time = now
+            return customers
+        else:
+            print(f"[错误] SaleSmartly返回异常: {data}")
+            return []
+    except Exception as e:
+        print(f"[错误] 请求SaleSmartly失败: {e}")
+        return []
+
+
+# ========================================
+# 写入简道云
+# ========================================
+def write_to_jiandaoyun(customer: dict):
+    headers = {
+        "Authorization": f"Bearer {JDY_API_KEY}",
         "Content-Type": "application/json"
     }
 
     payload = {
         "data": {
-            "_widget_1711089179446": {"value": customer_name},       # 客户名字
-            "_widget_1706178443484": {"value": whatsapp},            # 客户手机号(Whatsapp)
-            "_widget_1706178443483": {"value": email},               # 客户邮箱
-            "_widget_1706177627141": {"value": company_name},        # 公司名称
-            "_widget_1706259112687": {"value": company_website},     # 公司网址
-            "_widget_1711089179447": {"value": country},             # 客户国家
-            "_widget_1706250922588": {"value": city},                # 客户城市
-            "_widget_1706250922593": {"value": main_product},        # 主营产品
-            "_widget_1706259707456": {"value": source},              # 线索来源
-            "_widget_1706259112693": {"value": customer_type},       # 客户类型
-            "_widget_1706178443481": {"value": salesperson},         # 业务名称
-            "_widget_1706259112688": {"value": customer_segment},    # 客户分组
-            "_widget_1748335923699": {"value": follow_status},       # 跟进状态
-            "_widget_1748946748107": {"value": remark},              # 备注
+            "_widget_1711089179446": {"value": customer.get("name") or customer.get("remark_name") or ""},
+            "_widget_1706178443484": {"value": customer.get("phone") or ""},
+            "_widget_1706178443483": {"value": customer.get("email") or ""},
+            "_widget_1711089179447": {"value": customer.get("country") or ""},
+            "_widget_1706250922588": {"value": customer.get("city") or ""},
+            "_widget_1706259707456": {"value": customer.get("channel") or customer.get("channel_name") or ""},
+            "_widget_1706178443481": {"value": customer.get("sys_user_name") or ""},
+            "_widget_1748335923699": {"value": "新询盘"},
+            "_widget_1748946748107": {"value": customer.get("remark") or customer.get("content") or ""},
         }
     }
 
-    response = requests.post(JIANDAOYUN_URL, headers=headers, json=payload)
-    print(f"[简道云响应] {response.status_code}: {response.text}")
-    return response.status_code == 200
+    try:
+        response = requests.post(JDY_URL, headers=headers, json=payload, timeout=10)
+        if response.status_code == 200:
+            print(f"  ✅ 写入成功: {customer.get('name') or customer.get('remark_name') or '未知客户'}")
+            return True
+        else:
+            print(f"  ❌ 写入失败: {response.status_code} {response.text}")
+            return False
+    except Exception as e:
+        print(f"  ❌ 写入异常: {e}")
+        return False
 
 
 # ========================================
-# 健康检查
+# 定时同步主循环
+# ========================================
+def sync_loop():
+    print(f"[{datetime.now()}] 🚀 同步服务启动，每 {SYNC_INTERVAL} 秒同步一次")
+    while True:
+        try:
+            print(f"\n[{datetime.now()}] 开始同步...")
+            customers = fetch_new_customers()
+
+            if customers:
+                print(f"  发现 {len(customers)} 条新客户，写入简道云...")
+                success = 0
+                for c in customers:
+                    if write_to_jiandaoyun(c):
+                        success += 1
+                    time.sleep(0.3)
+                print(f"  ✅ 本次同步完成：{success}/{len(customers)} 条成功")
+            else:
+                print(f"  暂无新客户")
+
+        except Exception as e:
+            print(f"[同步错误] {e}")
+
+        time.sleep(SYNC_INTERVAL)
+
+
+# ========================================
+# 健康检查 & 手动触发
 # ========================================
 @app.route("/", methods=["GET"])
-def health_check():
-    return jsonify({"status": "running", "message": "询盘同步服务正在运行 ✅"}), 200
+def health():
+    return jsonify({
+        "status": "running ✅",
+        "sync_interval": f"每 {SYNC_INTERVAL} 秒同步一次",
+        "last_sync": datetime.fromtimestamp(last_sync_time).strftime("%Y-%m-%d %H:%M:%S")
+    })
+
+@app.route("/sync-now", methods=["GET"])
+def manual_sync():
+    """手动立即触发一次同步"""
+    customers = fetch_new_customers()
+    count = 0
+    for c in customers:
+        if write_to_jiandaoyun(c):
+            count += 1
+        time.sleep(0.3)
+    return jsonify({"status": "ok", "synced": count, "message": f"同步了 {count} 条数据"})
 
 
 if __name__ == "__main__":
+    t = threading.Thread(target=sync_loop, daemon=True)
+    t.start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
