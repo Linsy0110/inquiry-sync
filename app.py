@@ -32,8 +32,11 @@ last_sync_time = int(time.time()) - SYNC_INTERVAL
 # 生成 SaleSmartly 签名
 # ========================================
 def make_sign(params: dict) -> str:
+    # 文档规则：Token 在最前面，后面参数按字典序排序，用 & 连接，最后整体 MD5
     sorted_keys = sorted(params.keys())
-    sign_str = SS_TOKEN + "".join(f"{k}={params[k]}" for k in sorted_keys)
+    params_str = "&".join(f"{k}={params[k]}" for k in sorted_keys)
+    sign_str = SS_TOKEN + "&" + params_str
+    print(f"[签名原文] {sign_str}")
     return hashlib.md5(sign_str.encode("utf-8")).hexdigest()
 
 
